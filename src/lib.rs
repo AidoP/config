@@ -286,7 +286,7 @@ impl<'a> Token<'a> {
             // Ident token
             (mut i, c) if c.is_alphabetic() => {
                 i += c.len_utf8();
-                if let Some((end, c)) = chars.take_while(|(_, c)| c.is_alphanumeric()).last() {
+                if let Some((end, c)) = chars.take_while(|&(_, c)| c.is_alphanumeric() || c == '_').last() {
                     i = end + c.len_utf8();
                 }
                 Ok(Self {
