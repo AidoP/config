@@ -1,4 +1,13 @@
-use std::{fmt, io::{self, Read, Write}, ops::Deref, path::{Path, PathBuf}, fs::File, str::FromStr, collections::HashMap};
+use std::{
+    collections::HashMap,
+    fmt,
+    fs::File,
+    io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    ops::Deref,
+    path::{Path, PathBuf},
+    str::FromStr
+};
 
 pub mod prelude {
     pub use config_macro::Config;
@@ -11,12 +20,10 @@ pub trait Config: Default {
     fn set<'a>(&mut self, field: &Field<'a>) -> Result<'a, ()>;
     /// Load the configuration from all default sources
     /// 
-    /// All configuration sources will be attempted to read from, regardless of previous errors.
-    /// If an error occurs while reading a configuration source it will be printed to stderr and Err(Self) will return.
-    /// Configuration sources that cannot be found do not result in an error.
+    /// `errors` specifies a writer for errors to be pretty-printed to, or stderr if None.
     fn load(errors: Option<&mut dyn Write>) -> Self {
         let mut config = Self::default();
-        config.load_file(format!("examples/{}.config", Self::NAME.to_lowercase()), errors).ok();
+        config.load_file(format!("{}.config", Self::NAME.to_lowercase()), errors).ok();
         
         config
     }
@@ -187,6 +194,20 @@ pub struct Spanned<'a> {
     str: &'a str,
     /// Byte index that the string spans from in the parent string
     starts: usize
+}
+impl<'a> Spanned<'a> {
+    /// Return the inner string without the surrounding quotation marks
+    /// 
+    /// Behaviour is unspecified if the inner string is not wrapped in quotation marks
+    pub fn quoted(&self) -> &'a str {
+        &self.str[1..self.str.len()-1]
+    }
+}
+impl<'a> Deref for Spanned<'a> {
+    type Target = str;
+    fn deref(&self) -> &'a Self::Target {
+        &self.str
+    }
 }
 impl<'a> fmt::Display for Spanned<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -693,8 +714,7 @@ impl FromValue for String {
         match value {
             Value::Default(_) => Ok(*self = Default::default()),
             Value::String(span) => {
-                const SIZE: usize = '"'.len_utf8();
-                Ok(*self = (&span.str[SIZE..span.str.len()-SIZE]).to_owned())
+                Ok(*self = span.quoted().to_owned())
             }
             _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
         }
@@ -705,12 +725,16 @@ impl FromValue for PathBuf {
         DataType::String
     }
     fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        let mut string = String::new();
-        string.from_value(value)?;
-        if let Ok(path) = PathBuf::from_str(&string) {
-            Ok(*self = path)
-        } else {
-            Err(Error::InvalidType(value.clone(), DataType::String))
+        match value {
+            Value::Default(_) => Ok(*self = Default::default()),
+            Value::String(span) => {
+                if let Ok(path) = Self::from_str(span.quoted()) {
+                    Ok(*self = path)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            }
+            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
         }
     }
 }
@@ -724,6 +748,78 @@ impl FromValue for bool {
             Value::Bool(span) => {
                 Ok(*self = span.str == "true")
             }
+            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for IpAddr {
+    fn data_type() -> DataType {
+        DataType::Number
+    }
+    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
+        match value {
+            Value::Number(addr) => {
+                if let Ok(addr) = Self::from_str(addr.str) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
+            Value::String(span) => {
+                if let Ok(addr) = Self::from_str(span.quoted()) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
+            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for Ipv4Addr {
+    fn data_type() -> DataType {
+        DataType::Number
+    }
+    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
+        match value {
+            Value::Number(addr) => {
+                if let Ok(addr) = Self::from_str(addr.str) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
+            Value::String(span) => {
+                if let Ok(addr) = Self::from_str(span.quoted()) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
+            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for Ipv6Addr {
+    fn data_type() -> DataType {
+        DataType::Number
+    }
+    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
+        match value {
+            Value::Number(addr) => {
+                if let Ok(addr) = Self::from_str(addr.str) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
+            Value::String(span) => {
+                if let Ok(addr) = Self::from_str(span.quoted()) {
+                    Ok(*self = addr)
+                } else {
+                    Err(Error::InvalidType(value.clone(), Self::data_type()))
+                }
+            },
             _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
         }
     }
