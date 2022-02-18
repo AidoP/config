@@ -1,4 +1,4 @@
-use std::{fmt, io::{self, Read, Write}, ops::Deref, path::Path, fs::File, str::FromStr, collections::HashMap};
+use std::{fmt, io::{self, Read, Write}, ops::Deref, path::{Path, PathBuf}, fs::File, str::FromStr, collections::HashMap};
 
 pub mod prelude {
     pub use config_macro::Config;
@@ -16,7 +16,7 @@ pub trait Config: Default {
     /// Configuration sources that cannot be found do not result in an error.
     fn load(errors: Option<&mut dyn Write>) -> Self {
         let mut config = Self::default();
-        config.load_file(format!("{}.config", Self::NAME), errors).ok();
+        config.load_file(format!("examples/{}.config", Self::NAME.to_lowercase()), errors).ok();
         
         config
     }
@@ -285,44 +285,10 @@ impl<'a> Token<'a> {
                 }
             }
             // Number token
-            (mut i, mut c) if c.is_ascii_digit() || c == '-' || c == '+' => {
-                if c == '+' || c == '-' {
-                    if let Some((ni, nc)) = chars.next() {
-                        i = ni;
-                        c = nc;
-                    } else {
-                        return Err(Error::EndOfFile(lexer.to_end()))
-                    }
-                }
-                if c == '0' {
-                    if let Some(&(ni, nc)) = chars.peek() {
-                        i = ni;
-                        c = nc;
-                        chars.next();
-                        // Following 0x, 0o and 0b must be a digit
-                        if let Some(&(ni, nc)) = chars.peek() {
-                            if !nc.is_ascii_digit() {
-                                lexer.split_at(ni + nc.len_utf8());
-                                return Err(Error::InvalidInput(lexer.here()))
-                            }
-                        }
-                    }
-                }
+            (mut i, c) if c.is_ascii_digit() || c == '-' || c == '+' || c == '$' => {
                 i += c.len_utf8();
-                let mut had_dot = false;
-                if let Some((end, c)) = chars.take_while(|&(_, c)| c.is_ascii_digit() ||
-                    if !had_dot {
-                        if c == '.' {
-                            had_dot = true;
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                ).last() {
-                    i = end + c.len_utf8();
+                if let Some((ei, c)) = chars.take_while(|&(_, c)| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '%').last() {
+                    i = ei + c.len_utf8()
                 }
                 Ok(Self {
                     span: lexer.split_at(i),
@@ -447,12 +413,31 @@ pub enum Value<'a> {
     }
 }
 #[derive(Debug, Clone)]
-pub struct Values<'a>(Vec<Value<'a>>);
+pub struct SeperatedValue<'a> {
+    value: Value<'a>,
+    _seperator: Option<Spanned<'a>>
+}
+impl<'a> SeperatedValue<'a> {
+    fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
+        Ok(Self {
+            value: Value::parse(tokens)?,
+            _seperator: tokens.peek().map(|t| if t.ty == TokenType::Seperator { tokens.pop().map(|t| t.span) } else { None }).flatten()
+        })
+    }
+}
+impl<'a> Deref for SeperatedValue<'a> {
+    type Target = Value<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+#[derive(Debug, Clone)]
+pub struct Values<'a>(Vec<SeperatedValue<'a>>);
 impl<'a> Values<'a> {
     fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
         let mut values = Vec::new();
         while tokens.peek().map(|t| Value::is_start(t)).unwrap_or(false) {
-            values.push(Value::parse(tokens)?)
+            values.push(SeperatedValue::parse(tokens)?)
         }
         Ok(Self(values))
     }
@@ -522,50 +507,36 @@ impl<'a> Value<'a> {
             Self::Struct {..} => DataType::Struct("Any")
         }
     }
-    /// Parses an integer including radix and sign prefixes
-    /// 
-    /// # Panics
-    /// Panics if the string is not an optional sign followed by an optional radix prefix followed by 1 or more characters
+    /// Attempts to interpret the number in the form `[+|-][0(x|b|o)]\d*`, splitting into (sign, radix, digits) parts
     fn int_parts(str: &str) -> (bool, u32, &str) {
-        let mut chars = str.char_indices().peekable();
-        let signed = if let Some(&(_, c)) = chars.peek() {
-            if c == '-' || c == '+' {
-                chars.next();
-            }
-            c == '-'
-        } else {
-            false
-        };
-        let radix = if let Some(&(_, c)) = chars.peek() {
-            if c == '0' {
-                // It is fine to discard the leading 0 if it is not a radix prefix
-                chars.next();
-                if let Some(&(_, c)) = chars.peek() {
-                    let radix = match c {
-                        'b' => 2,
-                        'o' => 8,
-                        'x' => 16,
-                        _ => 10
-                    };
-                    if radix != 10 {
-                        chars.next();
-                    }
-                    radix
-                } else {
-                    10
-                }
-            } else {
-                10
-            }
-        } else {
-            10
-        };
-        let start = chars.next().unwrap().0;
-        (signed, radix, &str[start..])
+        match str.as_bytes() {
+            [sign @ (b'-' | b'+'), b'0', radix @ (b'x' | b'o' | b'b'), ..] => (
+                *sign == b'-',
+                match *radix {
+                    b'x' => 16,
+                    b'o' => 8,
+                    b'b' => 2,
+                    _ => unreachable!()
+                },
+                &str[3..]
+            ),
+            [b'0', radix @ (b'x' | b'o' | b'b'), ..] =>  (
+                false,
+                match *radix {
+                    b'x' => 16,
+                    b'o' => 8,
+                    b'b' => 2,
+                    _ => unreachable!()
+                },
+                &str[2..]
+            ),
+            [sign @ (b'-' | b'+'), ..] =>  (*sign == b'-', 10, &str[1..]),
+            _ => (false, 10, str)
+        }
     }
 }
 impl<'a> Deref for Values<'a> {
-    type Target = [Value<'a>];
+    type Target = [SeperatedValue<'a>];
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -583,7 +554,7 @@ macro_rules! from_value_int {
                     Value::Number(span) => {
                         let (signed, radix, str) = Value::int_parts(span.str);
                         if signed {
-                            Err(Error::InvalidType(value.clone(), Self::data_type()))
+                            Err(Error::InvalidNumber(value.clone(), Self::data_type()))
                         } else {
                             if let Ok(i) = <$ty>::from_str_radix(str, radix) {
                                 Ok(*self = i)
@@ -643,10 +614,13 @@ impl<T> FromValue for Option<T> where T: FromValue + Default {
         match value {
             Value::Default(_) => Ok(*self = Default::default()),
             Value::None(_) => Ok(*self = None),
-            value => {
-                let mut item: T = Default::default();
-                item.from_value(value)?;
-                Ok(*self = Some(item))
+            value => match self {
+                Some(v) => v.from_value(value),
+                None => {
+                    let mut item: T = Default::default();
+                    item.from_value(value)?;
+                    Ok(*self = Some(item))
+                }
             }
         }
     }
@@ -680,9 +654,13 @@ impl<T> FromValue for HashMap<String, T> where T: FromValue + Default {
             Value::Default(_) => Ok(*self = Default::default()),
             Value::Struct { fields, ..} => {
                 for field in fields.iter() {
-                    let mut item = Default::default();
-                    T::from_value(&mut item, field.value())?;
-                    self.insert(field.name().into(), item);
+                    if let Some(item) = self.get_mut(field.name()) {
+                        item.from_value(value)?
+                    } else {
+                        let mut item = T::default();
+                        item.from_value(field.value())?;
+                        self.insert(field.name().into(), item);
+                    }
                 }
                 Ok(())
             }
@@ -719,6 +697,20 @@ impl FromValue for String {
                 Ok(*self = (&span.str[SIZE..span.str.len()-SIZE]).to_owned())
             }
             _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for PathBuf {
+    fn data_type() -> DataType {
+        DataType::String
+    }
+    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
+        let mut string = String::new();
+        string.from_value(value)?;
+        if let Ok(path) = PathBuf::from_str(&string) {
+            Ok(*self = path)
+        } else {
+            Err(Error::InvalidType(value.clone(), DataType::String))
         }
     }
 }
@@ -849,7 +841,7 @@ impl<'a> Error<'a> {
             Self::ExpectedValue(Some(got)) => writeln!(writer, "Expected a value, got '{}'", got.ty),
             Self::ExpectedValue(None) => writeln!(writer, "Expected a value but input ended"),
             Self::InvalidType(value, expected) => writeln!(writer, "Expected a value of type '{}', but got '{}'", expected, value.data_type()),
-            Self::InvalidNumber(value, expected) => writeln!(writer, "Number '{}' cannot be represented by '{}'", value.span(lexer), expected),
+            Self::InvalidNumber(value, expected) => writeln!(writer, "Number '{}' cannot be stored in '{}'", value.span(lexer), expected),
             Self::NoField(field, structure) => writeln!(writer, "Struct '{}' has no field '{}'", structure, field.name()),
         };
     }
