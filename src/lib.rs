@@ -1,31 +1,47 @@
 use std::{
-    collections::HashMap,
+    borrow::Cow,
     fmt,
     fs::File,
     io::{self, Read, Write},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     ops::Deref,
-    path::{Path, PathBuf},
-    str::FromStr
+    path::Path,
 };
 
+mod from;
+pub use from::FromValue;
 pub mod prelude {
     pub use config_macro::Config;
     pub use super::Config;
 }
 
-pub trait Config: Default {
-    /// The name of the configuration, used to find files and as the env vars prefix
-    const NAME: &'static str;
+pub trait Struct {
     fn set<'a>(&mut self, field: &Field<'a>) -> Result<'a, ()>;
-    /// Load the configuration from all default sources
+}
+
+impl<T> Config for T where T: Struct + Default {}
+pub trait Config: Struct + Default {
+    /// Load the configuration from all default sources.
+    /// 
+    /// `name` is used to find files and as a prefix for environment variables and should be one word.
     /// 
     /// `errors` specifies a writer for errors to be pretty-printed to, or stderr if None.
-    fn load(errors: Option<&mut dyn Write>) -> Self {
+    fn load(name: &str, errors: Option<&mut dyn Write>) -> Self {
         let mut config = Self::default();
-        config.load_file(format!("{}.config", Self::NAME.to_lowercase()), errors).ok();
-        
+        Self::load_into(&mut config, name, errors);
         config
+    }
+    /// Load the configuration from all default sources into an existing struct
+    /// 
+    /// See `Config::load()`
+    fn load_into(config: &mut Self, name: &str, errors: Option<&mut dyn Write>) {
+        let mut stderr = std::io::stderr();
+        let errors = if let Some(errors) = errors {
+            errors
+        } else {
+            &mut stderr
+        };
+        config.load_file(format!("{}.config", name), Some(errors)).ok();
+        config.load_env(name, Some(errors));
     }
     fn load_str(&mut self, str: &str, location: &str, errors: Option<&mut dyn Write>) {
         let mut lexer = Lexer::new(str);
@@ -55,7 +71,49 @@ pub trait Config: Default {
         Ok(self.load_str(&source, &location, errors))
     }
     fn load_env(&mut self, prefix: &str, errors: Option<&mut dyn Write>) {
-
+        let mut stderr = std::io::stderr();
+        let errors = if let Some(errors) = errors {
+            errors
+        } else {
+            &mut stderr
+        };
+        let mut prefix = prefix.to_uppercase();
+        // Safety: Only ASCII characters (ie. the same size) are mutated
+        unsafe { prefix.as_bytes_mut().iter_mut().for_each(|c| if *c == b' ' { *c = b'_' }) };
+        let prefix = prefix + "_";
+        fn reconstruct<'a>(key: &'a str, value: &'a str) -> String {
+            let mut fields = key.split('_');
+            if let Some(field) = fields.next() {
+                // TODO: proper string case transformation
+                let field = field.to_lowercase();
+                let mut input = format!("{}: ", field);
+                for field in fields.clone() {
+                    let field = field.to_lowercase();
+                    input.push_str(&format!("{{ {}: ", field))
+                }
+                input.push_str(value);
+                for _ in fields {
+                    input.push_str(" }")
+                }
+                input
+            } else {
+                "".into()
+            }
+        }
+        for (key, value) in std::env::vars() {
+            if let Some(stripped) = key.strip_prefix(&prefix) {
+                let source = reconstruct(stripped, &value);
+                let mut lexer = Lexer::new(&source);
+                let result = || -> Result<'_, ()> {
+                    let tokens = lexer.lex()?;
+                    let mut tokens = Tokens(&tokens);
+                    self.set(&Field::parse(&mut tokens)?)
+                }();
+                if let Err(e) = result {
+                    e.explain(errors, &format!("environment variable {}", key), &lexer)
+                }
+            }
+        }
     }
 }
 
@@ -158,7 +216,7 @@ impl<'a> Lexer<'a> {
                 _ => col += 1
             }
         }
-        (row + 1, col + 1)
+        (row + 1, col)
     }
     pub fn line(&self, span: Spanned<'a>) -> (&'a str, usize) {
         let mut line = self.source;
@@ -181,27 +239,24 @@ impl<'a> Lexer<'a> {
         let (line, before) = self.line(span);
         let mut underline = String::with_capacity(line.len());
         for _ in 0..before { underline.push(' ') }
-        for _ in 0..span.str.len() { underline.push('^') }
+        for _ in 0..span.str.chars().count() { underline.push('^') }
         let line_num = format!(" {} ", line_num);
         let padding = " ".repeat(line_num.len());
 
         format!("{padding}|\n{line_num}| {}\n{padding}| {}", line, underline, padding=padding, line_num=line_num)
     }
 }
-
+#[macro_export]
+macro_rules! identifier {
+    ($identifier:expr) => {
+        $crate::Value::Ident($crate::Spanned { str: $identifier, ..})
+    };
+}
 #[derive(Debug, Clone, Copy)]
 pub struct Spanned<'a> {
-    str: &'a str,
+    pub str: &'a str,
     /// Byte index that the string spans from in the parent string
     starts: usize
-}
-impl<'a> Spanned<'a> {
-    /// Return the inner string without the surrounding quotation marks
-    /// 
-    /// Behaviour is unspecified if the inner string is not wrapped in quotation marks
-    pub fn quoted(&self) -> &'a str {
-        &self.str[1..self.str.len()-1]
-    }
 }
 impl<'a> Deref for Spanned<'a> {
     type Target = str;
@@ -263,10 +318,9 @@ pub struct Token<'a> {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenType {
+    Escaped,
     Ident,
     Assignment,
-    String,
-    Number,
     Seperator,
     ArrayOpen,
     ArrayClose,
@@ -274,19 +328,24 @@ pub enum TokenType {
     StructClose
 }
 impl<'a> Token<'a> {
+    const ESCAPE: char = '"';
     const ASSIGNMENT: char = ':';
     const SEPERATOR: char = ',';
     const STRUCT_OPEN: char = '{';
     const STRUCT_CLOSE: char = '}';
     const ARRAY_OPEN: char = '[';
     const ARRAY_CLOSE: char = ']';
+    const RESERVED: &'static [char] = &[Self::ESCAPE, Self::ASSIGNMENT, Self::SEPERATOR, Self::STRUCT_OPEN, Self::STRUCT_CLOSE, Self::ARRAY_OPEN, Self::ARRAY_CLOSE];
     fn lex(lexer: &mut Lexer<'a>) -> Result<'a, Self> {
         let mut chars = lexer.char_indices().peekable();
+        fn is_ident(char: char) -> bool {
+            !(Token::RESERVED.contains(&char) || char.is_whitespace())
+        }
         match chars.next().ok_or(Error::EndOfFile(lexer.to_end()))? {
             // Ident token
-            (mut i, c) if c.is_alphabetic() => {
+            (mut i, c) if is_ident(c) => {
                 i += c.len_utf8();
-                if let Some((end, c)) = chars.take_while(|&(_, c)| c.is_alphanumeric() || c == '_').last() {
+                if let Some((end, c)) = chars.take_while(|&(_, c)| is_ident(c)).last() {
                     i = end + c.len_utf8();
                 }
                 Ok(Self {
@@ -294,27 +353,21 @@ impl<'a> Token<'a> {
                     ty: TokenType::Ident
                 })
             },
-            // String token
+            // Escaped token
             (_, '"') => {
-                if let Some((end, c)) = chars.find(|&(_, c)| c == '"') {
+                let mut escaped = false;
+                if let Some((end, c)) = chars.find(|&(_, c)| {
+                    let ret = c == '"' && !escaped;
+                    escaped = c == '\\' && !escaped;
+                    ret
+                }) {
                     Ok(Self {
                         span: lexer.split_at(end + c.len_utf8()),
-                        ty: TokenType::String
+                        ty: TokenType::Escaped
                     })
                 } else {
                     Err(Error::EndOfFile(lexer.to_end()))
                 }
-            }
-            // Number token
-            (mut i, c) if c.is_ascii_digit() || c == '-' || c == '+' || c == '$' => {
-                i += c.len_utf8();
-                if let Some((ei, c)) = chars.take_while(|&(_, c)| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '%').last() {
-                    i = ei + c.len_utf8()
-                }
-                Ok(Self {
-                    span: lexer.split_at(i),
-                    ty: TokenType::Number
-                })
             }
             (i, Self::ASSIGNMENT) => Ok(Self {
                 span: lexer.split_at(i + Self::ASSIGNMENT.len_utf8()),
@@ -357,8 +410,7 @@ impl fmt::Display for TokenType {
         match self {
             Self::Ident => write!(f, "identifier"),
             Self::Assignment => write!(f, ":"),
-            Self::String => write!(f, "string"),
-            Self::Number => write!(f, "number"),
+            Self::Escaped => write!(f, "string"),
             Self::Seperator => write!(f, ","),
             Self::ArrayOpen => write!(f, "["),
             Self::ArrayClose => write!(f, "]"),
@@ -370,7 +422,7 @@ impl fmt::Display for TokenType {
 
 #[derive(Debug, Clone)]
 pub struct Field<'a> {
-    ident: Spanned<'a>,
+    field: Value<'a>,
     _assignment: Spanned<'a>,
     value: Value<'a>,
     _seperator: Option<Spanned<'a>>
@@ -378,24 +430,20 @@ pub struct Field<'a> {
 impl<'a> Field<'a> {
     fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
         Ok(Self {
-            ident: tokens.pop_is(TokenType::Ident)?,
+            field: Value::parse(tokens)?,
             _assignment: tokens.pop_is(TokenType::Assignment)?,
             value: Value::parse(tokens)?,
             _seperator: tokens.peek().map(|t| if t.ty == TokenType::Seperator { tokens.pop().map(|t| t.span) } else { None }).flatten()
         })
     }
     pub fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
-        lexer.between(self.ident, self.value.span(lexer))
+        lexer.between(self.field.span(lexer), self.value.span(lexer))
     }
-    pub fn name(&self) -> &'a str {
-        self.ident.str
+    pub fn field(&self) -> &Value<'a> {
+        &self.field
     }
     pub fn value(&self) -> &Value<'a> {
         &self.value
-    }
-    pub fn destructure(self) -> (&'a str, Value<'a>) {
-        let Self { ident, value, ..} = self;
-        (ident.str, value)
     }
 }
 #[derive(Debug, Clone)]
@@ -417,11 +465,9 @@ impl<'a> Deref for Fields<'a> {
 }
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
-    String(Spanned<'a>),
-    Number(Spanned<'a>),
-    Default(Spanned<'a>),
-    None(Spanned<'a>),
-    Bool(Spanned<'a>),
+    /// A string with escaped values
+    Escaped(Spanned<'a>),
+    Ident(Spanned<'a>),
     Array {
         open: Spanned<'a>,
         values: Values<'a>,
@@ -457,7 +503,7 @@ pub struct Values<'a>(Vec<SeperatedValue<'a>>);
 impl<'a> Values<'a> {
     fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
         let mut values = Vec::new();
-        while tokens.peek().map(|t| Value::is_start(t)).unwrap_or(false) {
+        while tokens.peek().map(|t| t.ty != TokenType::ArrayClose).unwrap_or(false) {
             values.push(SeperatedValue::parse(tokens)?)
         }
         Ok(Self(values))
@@ -466,11 +512,8 @@ impl<'a> Values<'a> {
 impl<'a> Value<'a> {
     fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
         match tokens.pop().ok_or(Error::ExpectedValue(None))? {
-            Token { ty: TokenType::String, span } => Ok(Self::String(span)),
-            Token { ty: TokenType::Number, span } => Ok(Self::Number(span)),
-            Token { ty: TokenType::Ident, span: span @ Spanned { str: "default", ..} } => Ok(Self::Default(span)),
-            Token { ty: TokenType::Ident, span: span @ Spanned { str: "none", ..} } => Ok(Self::None(span)),
-            Token { ty: TokenType::Ident, span: span @ Spanned { str: "true" | "false", ..} } => Ok(Self::Bool(span)),
+            Token { ty: TokenType::Ident, span } => Ok(Self::Ident(span)),
+            Token { ty: TokenType::Escaped, span } => Ok(Self::Escaped(span)),
             Token { ty: TokenType::ArrayOpen, span: open } => {
                 Ok(Self::Array {
                     open,
@@ -488,44 +531,44 @@ impl<'a> Value<'a> {
             token => Err(Error::ExpectedValue(Some(token)))
         }
     }
-    /// Returns true if the token may start, or be, a new value
-    fn is_start(token: Token) -> bool {
-        match token {
-            Token { ty: TokenType::String, ..} => true,
-            Token { ty: TokenType::Number, ..} => true,
-            Token { ty: TokenType::Ident, span: Spanned { str: "default", ..} } => true,
-            Token { ty: TokenType::Ident, span: Spanned { str: "true" | "false", ..} } => true,
-            Token { ty: TokenType::ArrayOpen, ..} => true,
-            Token { ty: TokenType::StructOpen, ..} => true,
-            _ => false
+    pub fn clean(&self, expected: DataType) -> Result<'a, Cow<'a, str>> {
+        match self {
+            Self::Ident(Spanned { str, ..}) => Ok(Cow::Borrowed(str)),
+            Self::Escaped(Spanned { str, starts }) => {
+                let str = &str[1..str.len()-1];
+                // Most strings won't have escape characters
+                if !str.contains('\\') {
+                    Ok(Cow::Borrowed(str))
+                } else {
+                    // The string will have just slightly less characters than the original
+                    let mut string = String::with_capacity(str.len());
+                    let mut chars = str.char_indices();
+                    while let Some((i, c)) = chars.next() {
+                        if c == '\\' {
+                            match chars.next() {
+                                Some((_, '\\')) => string.push('\\'),
+                                Some((_, '"')) => string.push('"'),
+                                Some((_, 'n')) => string.push('\n'),
+                                Some((_, 'r')) => string.push('\r'),
+                                Some((ni, nc)) => return Err(Error::InvalidEscapeSequence(Spanned { str: &str[i..i+1+nc.len_utf8()], starts: starts + ni })),
+                                None => return Err(Error::InvalidEscapeSequence(Spanned { str: &str[i..], starts: starts + i + 1 }))
+                            }
+                        } else {
+                            string.push(c)
+                        }
+                    }
+                    Ok(Cow::Owned(string))
+                }
+            },
+            value => Err(Error::InvalidType(value.clone(), expected)),
         }
     }
     fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
         match self {
-            Self::String(span) => *span,
-            Self::Number(span) => *span,
-            Self::Default(span) => *span,
-            Self::None(span) => *span,
-            Self::Bool(span) => *span,
+            Self::Ident(span) => *span,
+            Self::Escaped(span) => *span,
             Self::Array {open, close, ..} => lexer.between(*open, *close),
             Self::Struct {open, close, ..} => lexer.between(*open, *close)
-        }
-    }
-    pub fn kind(self) -> ValueKind<'a> {
-        match self {
-            Self::Default(_) => ValueKind::Default,
-            value => ValueKind::Value(value)
-        }
-    }
-    pub fn data_type(&self) -> DataType {
-        match self {
-            Self::String(_) => DataType::String,
-            Self::Number(_) => DataType::Number,
-            Self::Default(_) => DataType::Any,
-            Self::None(_) => DataType::Option(Box::new(DataType::Any)),
-            Self::Bool(_) => DataType::Bool,
-            Self::Array {..} => DataType::Array(Box::new(DataType::Any)),
-            Self::Struct {..} => DataType::Struct("Any")
         }
     }
     /// Attempts to interpret the number in the form `[+|-][0(x|b|o)]\d*`, splitting into (sign, radix, digits) parts
@@ -563,349 +606,20 @@ impl<'a> Deref for Values<'a> {
     }
 }
 
-macro_rules! from_value_int {
-    (unsigned; $name:ident, $ty:ty, $bits:expr) => {
-        impl FromValue for $ty {
-            fn data_type() -> DataType {
-                DataType::Integer { signed: false, bits: $bits}
-            }
-            fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-                match value {
-                    Value::Default(_) => Ok(*self = Default::default()),
-                    Value::Number(span) => {
-                        let (signed, radix, str) = Value::int_parts(span.str);
-                        if signed {
-                            Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                        } else {
-                            if let Ok(i) = <$ty>::from_str_radix(str, radix) {
-                                Ok(*self = i)
-                            } else {
-                                Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                            }
-                        }
-                    }
-                    _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            }
-        }
-    };
-    (signed; $name:ident, $ty:ty, $bits:expr) => {
-        impl FromValue for $ty {
-            fn data_type() -> DataType {
-                DataType::Integer { signed: false, bits: $bits}
-            }
-            fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-                match value {
-                    Value::Default(_) => Ok(*self = Default::default()),
-                    Value::Number(span) => {
-                        let (signed, radix, str) = Value::int_parts(span.str);
-                        if let Ok(i) = <$ty>::from_str_radix(str, radix) {
-                            if signed {
-                                if let Some(i) = i.checked_neg() {
-                                    Ok(*self = i)
-                                } else {
-                                    Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                                }
-                            } else {
-                                Ok(*self = i)
-                            }
-                        } else {
-                            Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                        }
-                    }
-                    _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            }
-        }
-    };
-}
-pub enum ValueKind<'a> {
-    Default,
-    Value(Value<'a>)
-}
-pub trait FromValue: Sized {
-    fn data_type() -> DataType;
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()>;
-}
-impl<T> FromValue for Option<T> where T: FromValue + Default {
-    fn data_type() -> DataType {
-        DataType::Array(Box::new(T::data_type()))
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::None(_) => Ok(*self = None),
-            value => match self {
-                Some(v) => v.from_value(value),
-                None => {
-                    let mut item: T = Default::default();
-                    item.from_value(value)?;
-                    Ok(*self = Some(item))
-                }
-            }
-        }
-    }
-}
-impl<T> FromValue for Vec<T> where T: FromValue + Default {
-    fn data_type() -> DataType {
-        DataType::Array(Box::new(T::data_type()))
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Array { values, ..} => {
-                self.clear();
-                for value in values.iter() {
-                    let mut item = Default::default();
-                    T::from_value(&mut item, value)?;
-                    self.push(item)
-                }
-                Ok(())
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl<T> FromValue for HashMap<String, T> where T: FromValue + Default {
-    fn data_type() -> DataType {
-        DataType::Dictionary(Box::new(T::data_type()))
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Struct { fields, ..} => {
-                for field in fields.iter() {
-                    if let Some(item) = self.get_mut(field.name()) {
-                        item.from_value(value)?
-                    } else {
-                        let mut item = T::default();
-                        item.from_value(field.value())?;
-                        self.insert(field.name().into(), item);
-                    }
-                }
-                Ok(())
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl<T> FromValue for T where T: Config {
-    fn data_type() -> DataType {
-        DataType::Struct(T::NAME)
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Struct { fields, ..} => {
-                for field in fields.iter() {
-                    self.set(field)?
-                }
-                Ok(())
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for String {
-    fn data_type() -> DataType {
-        DataType::String
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::String(span) => {
-                Ok(*self = span.quoted().to_owned())
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for PathBuf {
-    fn data_type() -> DataType {
-        DataType::String
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::String(span) => {
-                if let Ok(path) = Self::from_str(span.quoted()) {
-                    Ok(*self = path)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for bool {
-    fn data_type() -> DataType {
-        DataType::Bool
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Bool(span) => {
-                Ok(*self = span.str == "true")
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for IpAddr {
-    fn data_type() -> DataType {
-        DataType::Number
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Number(addr) => {
-                if let Ok(addr) = Self::from_str(addr.str) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            Value::String(span) => {
-                if let Ok(addr) = Self::from_str(span.quoted()) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for Ipv4Addr {
-    fn data_type() -> DataType {
-        DataType::Number
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Number(addr) => {
-                if let Ok(addr) = Self::from_str(addr.str) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            Value::String(span) => {
-                if let Ok(addr) = Self::from_str(span.quoted()) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for Ipv6Addr {
-    fn data_type() -> DataType {
-        DataType::Number
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Number(addr) => {
-                if let Ok(addr) = Self::from_str(addr.str) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            Value::String(span) => {
-                if let Ok(addr) = Self::from_str(span.quoted()) {
-                    Ok(*self = addr)
-                } else {
-                    Err(Error::InvalidType(value.clone(), Self::data_type()))
-                }
-            },
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for f32 {
-    fn data_type() -> DataType {
-        DataType::Float32
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Number(span) => {
-                if let Ok(f) = f32::from_str(span.str) {
-                    Ok(*self = f)
-                } else {
-                    Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                }
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-impl FromValue for f64 {
-    fn data_type() -> DataType {
-        DataType::Float64
-    }
-    fn from_value<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        match value {
-            Value::Default(_) => Ok(*self = Default::default()),
-            Value::Number(span) => {
-                if let Ok(f) = f64::from_str(span.str) {
-                    Ok(*self = f)
-                } else {
-                    Err(Error::InvalidNumber(value.clone(), Self::data_type()))
-                }
-            }
-            _ => Err(Error::InvalidType(value.clone(), Self::data_type()))
-        }
-    }
-}
-from_value_int!{unsigned; as_u8, u8, 8}
-from_value_int!{signed; as_i8, i8, 8}
-from_value_int!{unsigned; as_u16, u16, 16}
-from_value_int!{signed; as_i16, i16, 16}
-from_value_int!{unsigned; as_u32, u32, 32}
-from_value_int!{signed; as_i32, i32, 32}
-from_value_int!{unsigned; as_u64, u64, 64}
-from_value_int!{signed; as_i64, i64, 64}
-from_value_int!{unsigned; as_u128, u128, 128}
-from_value_int!{signed; as_i128, i128, 128}
-from_value_int!{unsigned; as_usize, usize, usize::BITS as _}
-from_value_int!{signed; as_isize, isize, usize::BITS as _}
-
 #[derive(Debug)]
 pub enum DataType {
-    String,
-    Bool,
-    Option(Box<DataType>),
-    Array(Box<DataType>),
-    Dictionary(Box<DataType>),
-    Struct(&'static str),
-    Integer {
-        signed: bool,
-        bits: u8
-    },
-    Float32,
-    Float64,
-    /// Any number
-    Number,
-    /// Equivalent to any value
-    Any
+    Wrapper(&'static str, Box<DataType>),
+    Named(&'static str),
+    Array(usize, Box<DataType>),
+    Dictionary(Box<DataType>, Box<DataType>)
 }
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::String => write!(f, "String"),
-            Self::Bool => write!(f, "bool"),
-            Self::Option(ty) => write!(f, "Option<{}>", ty),
-            Self::Array(ty) => write!(f, "Vec<{}>", ty),
-            Self::Dictionary(ty) => write!(f, "HashMap<String, {}>", ty),
-            Self::Struct(name) => write!(f, "struct {}", name),
-            &Self::Integer { signed, bits } => write!(f, "{}{}", if signed { 'i' } else { 'u' }, bits),
-            Self::Float32 => write!(f, "f32"),
-            Self::Float64 => write!(f, "f64"),
-            Self::Number => write!(f, "<Number>"),
-            Self::Any => write!(f, "<Any>")
+            Self::Wrapper(prefix, wrapped) => write!(f, "{} {}", prefix, wrapped),
+            Self::Named(name) => write!(f, "{}", name),
+            Self::Array(size, ty) => write!(f, "[{}; {}]", ty, size),
+            Self::Dictionary(keys, values) => write!(f, "dictionary with {} keys and {} values", keys, values)
         }
     }
 }
@@ -914,13 +628,17 @@ pub type Result<'a, T> = std::result::Result<T, Error<'a>>;
 #[derive(Debug)]
 pub enum Error<'a> {
     InvalidInput(Spanned<'a>),
+    InvalidEscapeSequence(Spanned<'a>),
     EndOfFile(Spanned<'a>),
     ExpectedToken(Option<Token<'a>>, TokenType),
     /// Like expected token, but many tokens are valid
     ExpectedValue(Option<Token<'a>>),
     InvalidType(Value<'a>, DataType),
-    InvalidNumber(Value<'a>, DataType),
-    NoField(Field<'a>, &'static str)
+    NoDefault(Value<'a>, DataType),
+    NoField(Field<'a>, DataType),
+    MissingField(Value<'a>, &'static str, DataType),
+    NoNew(Value<'a>, DataType),
+    Unavailable(Value<'a>)
 }
 impl<'a> Error<'a> {
     // It doesn't matter writing fails here
@@ -931,27 +649,36 @@ impl<'a> Error<'a> {
         writeln!(writer, "error: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line));
         match self {
             Self::InvalidInput(_) => writeln!(writer, "No token expects this input"),
+            Self::InvalidEscapeSequence(seq) => writeln!(writer, "Escape sequence '{}' is invalid. Perhaps you meant '\\\\'?", seq.str),
             Self::EndOfFile(_) => writeln!(writer, "The token is incomplete"),
             Self::ExpectedToken(Some(got), expected) => writeln!(writer, "Expected '{}', got '{}'", expected, got.ty),
             Self::ExpectedToken(None, expected) => writeln!(writer, "Expected '{}' but input ended", expected),
             Self::ExpectedValue(Some(got)) => writeln!(writer, "Expected a value, got '{}'", got.ty),
             Self::ExpectedValue(None) => writeln!(writer, "Expected a value but input ended"),
-            Self::InvalidType(value, expected) => writeln!(writer, "Expected a value of type '{}', but got '{}'", expected, value.data_type()),
-            Self::InvalidNumber(value, expected) => writeln!(writer, "Number '{}' cannot be stored in '{}'", value.span(lexer), expected),
-            Self::NoField(field, structure) => writeln!(writer, "Struct '{}' has no field '{}'", structure, field.name()),
+            Self::InvalidType(_, expected) => writeln!(writer, "Expected a value of type '{}' which can not store this value", expected),
+            Self::NoDefault(_, ty) => writeln!(writer, "Expected a value of type '{}' which cannot be emptied", ty),
+            Self::NoField(_, structure) => writeln!(writer, "'{}' does not contain this field", structure),
+            Self::MissingField(_, field, structure) => writeln!(writer, "'{}' requires field '{}' to be specified to create a new instance", structure, field),
+            Self::NoNew(_, ty) => writeln!(writer, "New instances of '{}' cannot be created", ty),
+            Self::Unavailable(_) => writeln!(writer, "Field is inaccessible")
         };
+        writeln!(writer);
     }
     fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
         match self {
             Self::InvalidInput(span) => *span,
+            Self::InvalidEscapeSequence(span) => *span,
             Self::EndOfFile(span) => *span,
             Self::ExpectedToken(Some(t), _) => t.span,
             Self::ExpectedToken(None, _) => lexer.end(),
             Self::ExpectedValue(Some(t)) => t.span,
             Self::ExpectedValue(None) => lexer.end(),
             Self::InvalidType(value, _) => value.span(lexer),
-            Self::InvalidNumber(value, _) => value.span(lexer),
-            Self::NoField(field, _) => field.span(lexer)
+            Self::NoDefault(none, _) => none.span(lexer),
+            Self::NoField(field, _) => field.span(lexer),
+            Self::MissingField(value, _, _) => value.span(lexer),
+            Self::NoNew(value, _) => value.span(lexer),
+            Self::Unavailable(value) => value.span(lexer)
         }
     }
 }
