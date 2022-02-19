@@ -14,6 +14,11 @@ pub mod prelude {
     pub use super::Config;
 }
 
+const RED: &'static str = "\x1b[91m";
+const BLUE: &'static str = "\x1b[94m";
+const ORANGE: &'static str = "\x1b[33m";
+const RESET: &'static str = "\x1b[0m";
+
 pub trait Struct {
     fn set<'a>(&mut self, field: &Field<'a>) -> Result<'a, ()>;
 }
@@ -218,32 +223,59 @@ impl<'a> Lexer<'a> {
         }
         (row + 1, col)
     }
-    pub fn line(&self, span: Spanned<'a>) -> (&'a str, usize) {
-        let mut line = self.source;
-        let mut starts = 0;
-        let mut last = (0, ' ');
-        for (i, c) in self.source.char_indices() {
-            if last.1 == '\n' {
-                if i <= span.starts {
-                    starts = last.0 + c.len_utf8();
-                    line = &self.source[i..]
-                } else {
-                    return (&line[..last.0-starts], span.starts-starts)
-                }
+    pub fn lines(&self, span: Spanned<'a>) -> Vec<Spanned<'a>> {
+        let mut lines = Vec::new();
+        let mut start = self.source[..span.starts].char_indices().rev().find_map(|(i, c)| (c == '\n').then(|| i + c.len_utf8())).unwrap_or(0);
+        let mut end = self.source[span.starts..].char_indices().find_map(|(i, c)| (c == '\n').then(|| i + span.starts)).unwrap_or(self.source.len());
+
+        loop {
+            lines.push(Spanned {
+                str: &self.source[start..end],
+                starts: start
+            });
+
+            if span.starts + span.len() <= end {
+                break lines
             }
-            last = (i, c);
+
+            start = end + 1;
+            end = self.source[start..].char_indices().find_map(|(i, c)| (c == '\n').then(|| i + start)).unwrap_or(self.source.len());
         }
-        (line, span.starts-starts)
     }
     pub fn context(&self, span: Spanned<'a>, line_num: usize) -> String {
-        let (line, before) = self.line(span);
-        let mut underline = String::with_capacity(line.len());
-        for _ in 0..before { underline.push(' ') }
-        for _ in 0..span.str.chars().count() { underline.push('^') }
-        let line_num = format!(" {} ", line_num);
-        let padding = " ".repeat(line_num.len());
+        let lines = self.lines(span);
+        let mut coloured_lines = Vec::with_capacity(lines.len());
 
-        format!("{padding}|\n{line_num}| {}\n{padding}| {}", line, underline, padding=padding, line_num=line_num)
+        let mut first_line = lines[0].str.to_string();
+        first_line.insert_str(span.starts - lines[0].starts, RED);
+        if lines.len() == 1 {
+            first_line.insert_str(((span.starts + span.str.len()) - lines[0].starts) + RED.len(), RESET);
+        }
+        coloured_lines.push(first_line);
+        if lines.len() > 1 {
+            for line in &lines[1..lines.len()-1] {
+                let mut line= line.str.to_string();
+                line.insert_str(0, RED);
+                coloured_lines.push(line)
+            }
+            let last = lines.last().unwrap();
+            let mut last_line = last.str.to_string();
+            last_line.insert_str((span.starts + span.str.len()) - last.starts, RESET);
+            last_line.insert_str(0, RED);
+            coloured_lines.push(last_line.to_string())
+        }
+
+        let from_arrow_padding = self.source[lines[0].starts..span.starts].chars().count() + 1;
+        let to_arrow_padding = self.source[lines.last().unwrap().starts..span.starts + span.str.len()].chars().count();
+        let num_padding = format!("{}", line_num + lines.len()).chars().count();
+        let mut context = format!(" {1:<0$} | {3:>2$}", num_padding, ' ', from_arrow_padding, 'v');
+        for (num, line) in coloured_lines.into_iter().enumerate() {
+            let num = line_num + num;
+            context.push_str(&format!("\n {1:<0$} | {2}{3}", num_padding, num, line, RESET))
+        }
+        context.push_str(&format!("\n {1:<0$} | {3:>2$}", num_padding, ' ', to_arrow_padding, '^'));
+
+        context
     }
 }
 #[macro_export]
@@ -616,10 +648,10 @@ pub enum DataType {
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Wrapper(prefix, wrapped) => write!(f, "{} {}", prefix, wrapped),
-            Self::Named(name) => write!(f, "{}", name),
-            Self::Array(size, ty) => write!(f, "[{}; {}]", ty, size),
-            Self::Dictionary(keys, values) => write!(f, "dictionary with {} keys and {} values", keys, values)
+            Self::Wrapper(prefix, wrapped) => write!(f, "{colour}{} {}{reset}", prefix, wrapped, colour=BLUE, reset=RESET),
+            Self::Named(name) => write!(f, "{colour}{}{reset}", name, colour=BLUE, reset=RESET),
+            Self::Array(size, ty) => write!(f, "[{}; {colour}{}{reset}]", ty, size, colour=ORANGE, reset=RESET),
+            Self::Dictionary(keys, values) => write!(f, "dictionary with {} {colour}keys{reset} and {} {colour}values{reset}", keys, values, colour=ORANGE, reset=RESET)
         }
     }
 }
@@ -655,7 +687,7 @@ impl<'a> Error<'a> {
             Self::ExpectedToken(None, expected) => writeln!(writer, "Expected '{}' but input ended", expected),
             Self::ExpectedValue(Some(got)) => writeln!(writer, "Expected a value, got '{}'", got.ty),
             Self::ExpectedValue(None) => writeln!(writer, "Expected a value but input ended"),
-            Self::InvalidType(_, expected) => writeln!(writer, "Expected a value of type '{}' which can not store this value", expected),
+            Self::InvalidType(_, expected) => writeln!(writer, "This is not a valid '{}'", expected),
             Self::NoDefault(_, ty) => writeln!(writer, "Expected a value of type '{}' which cannot be emptied", ty),
             Self::NoField(_, structure) => writeln!(writer, "'{}' does not contain this field", structure),
             Self::MissingField(_, field, structure) => writeln!(writer, "'{}' requires field '{}' to be specified to create a new instance", structure, field),
