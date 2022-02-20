@@ -1,12 +1,14 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
+    fs::{self, File, ReadDir},
+    io::{Read, Write},
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
     ops::{Deref, DerefMut},
     path::PathBuf,
     rc::Rc,
     str::FromStr,
-    sync::{Mutex, RwLock, Arc, mpsc::Sender}, fs::{File, ReadDir, self}, io::{Write, Read}
+    sync::{Arc, Mutex, RwLock, mpsc::Sender},
 };
 use super::{identifier, span, Result, Error, DataType, Value};
 
@@ -364,7 +366,7 @@ impl FromValue for File {
     }
 }
 impl FromValue for Box<dyn Read> {
-    fn data_type() -> DataType { DataType::Named("resource location") }
+    fn data_type() -> DataType { DataType::Named("readable resource location") }
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
         match value {
             identifier!("none") => Ok(Box::new(std::io::empty()) as _),
@@ -387,7 +389,7 @@ impl FromValue for Box<dyn Read> {
     }
 }
 impl FromValue for Box<dyn Write> {
-    fn data_type() -> DataType { DataType::Named("resource location") }
+    fn data_type() -> DataType { DataType::Named("writeable resource location") }
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
         match value {
             identifier!("none") => Ok(Box::new(std::io::sink()) as _),

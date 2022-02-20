@@ -40,8 +40,8 @@ impl Default for Web {
 }
 
 fn main() {
-    let mut config = Web::load("web", None);
+    let mut config = Web::load("web");
     // Cargo doesn't execute examples from this directory
-    config.load_str(include_str!("web.config"), "included web.config", None);
+    config.load_str(include_str!("web.config"), "included web.config");
     println!("{:#?}", config)
 }

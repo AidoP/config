@@ -2,7 +2,7 @@ use std::{
     borrow::Cow,
     fmt,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     ops::Deref,
     path::Path,
 };
@@ -30,25 +30,25 @@ pub trait Config: Struct + Default {
     /// `name` is used to find files and as a prefix for environment variables and should be one word.
     /// 
     /// `errors` specifies a writer for errors to be pretty-printed to, or stderr if None.
-    fn load(name: &str, errors: Option<&mut dyn Write>) -> Self {
+    /// 
+    /// ## Load Order
+    /// - `<name>.config`
+    /// - Environment Variables
+    /// - CLI Args
+    fn load(name: &str) -> Self {
         let mut config = Self::default();
-        Self::load_into(&mut config, name, errors);
+        Self::load_into(&mut config, name);
         config
     }
     /// Load the configuration from all default sources into an existing struct
     /// 
     /// See `Config::load()`
-    fn load_into(config: &mut Self, name: &str, errors: Option<&mut dyn Write>) {
-        let mut stderr = std::io::stderr();
-        let errors = if let Some(errors) = errors {
-            errors
-        } else {
-            &mut stderr
-        };
-        config.load_file(format!("{}.config", name), Some(errors)).ok();
-        config.load_env(name, Some(errors));
+    fn load_into(config: &mut Self, name: &str) {
+        config.load_file(format!("{}.config", name)).ok();
+        config.load_env(name);
+        config.load_args();
     }
-    fn load_str(&mut self, str: &str, location: &str, errors: Option<&mut dyn Write>) {
+    fn load_str(&mut self, str: &str, location: &str) {
         let mut lexer = Lexer::new(str);
         let result = || -> Result<'_, ()> {
             let tokens = lexer.lex()?;
@@ -60,28 +60,18 @@ pub trait Config: Struct + Default {
             Ok(())
         }();
         if let Err(e) = result {
-            if let Some(errors) = errors {
-                e.explain(errors, location, &lexer)
-            } else {
-                e.explain(&mut std::io::stderr(), location, &lexer)
-            };
+            e.explain(location, &lexer)
         }
     }
-    fn load_file<P: AsRef<Path>>(&mut self, path: P, errors: Option<&mut dyn Write>) -> io::Result<()> {
+    fn load_file<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let path = path.as_ref();
         let mut file = File::open(path)?;
         let mut source = String::new();
         file.read_to_string(&mut source)?;
         let location = path.display().to_string();
-        Ok(self.load_str(&source, &location, errors))
+        Ok(self.load_str(&source, &location))
     }
-    fn load_env(&mut self, prefix: &str, errors: Option<&mut dyn Write>) {
-        let mut stderr = std::io::stderr();
-        let errors = if let Some(errors) = errors {
-            errors
-        } else {
-            &mut stderr
-        };
+    fn load_env(&mut self, prefix: &str) {
         let mut prefix = prefix.to_uppercase();
         // Safety: Only ASCII characters (ie. the same size) are mutated
         unsafe { prefix.as_bytes_mut().iter_mut().for_each(|c| if *c == b' ' { *c = b'_' }) };
@@ -115,8 +105,48 @@ pub trait Config: Struct + Default {
                     self.set(&Field::parse(&mut tokens)?)
                 }();
                 if let Err(e) = result {
-                    e.explain(errors, &format!("environment variable {}", key), &lexer)
+                    e.explain(&format!("environment variable {}", key), &lexer)
                 }
+            }
+        }
+    }
+    fn load_args(&mut self) {
+        fn reconstruct<'a>(key: &'a str, value: &'a str) -> String {
+            let mut fields = key.split('-');
+            if let Some(field) = fields.next() {
+                let mut input = format!("{}: ", field);
+                for field in fields.clone() {
+                    input.push_str(&format!("{{ {}: ", field))
+                }
+                input.push_str(value);
+                for _ in fields {
+                    input.push_str(" }")
+                }
+                input
+            } else {
+                "".into()
+            }
+        }
+        // Todo: print help text
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            if let Some(arg) = arg.strip_prefix("--") {
+                if let Some(value) = args.next() {
+                    let source = reconstruct(&arg, &value);
+                    let mut lexer = Lexer::new(&source);
+                    let result = || -> Result<'_, ()> {
+                        let tokens = lexer.lex()?;
+                        let mut tokens = Tokens(&tokens);
+                        self.set(&Field::parse(&mut tokens)?)
+                    }();
+                    if let Err(e) = result {
+                        e.explain(&format!("argument {}", arg), &lexer)
+                    }
+                } else {
+                    eprintln!("argument {:?} requires a value", arg)
+                }
+            } else {
+                eprintln!("Argument {:?} must be prefixed with '--'", arg)
             }
         }
     }
@@ -721,26 +751,26 @@ pub enum Error<'a> {
 impl<'a> Error<'a> {
     // It doesn't matter writing fails here
     #[allow(unused_must_use)]
-    pub fn explain(self, writer: &mut dyn Write, location: &str, lexer: &Lexer) {
+    pub fn explain(self, location: &str, lexer: &Lexer) {
         let span = self.span(lexer);
         let (line, col) = lexer.position(span);
-        writeln!(writer, "{red}error{reset}: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line), red=RED, reset=RESET);
+        eprintln!("{red}error{reset}: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line), red=RED, reset=RESET);
         match self {
-            Self::InvalidInput(_) => writeln!(writer, "No token expects this input"),
-            Self::InvalidEscapeSequence(seq) => writeln!(writer, "Escape sequence '{}' is invalid. Perhaps you meant '\\\\'?", seq.str),
-            Self::EndOfFile(_) => writeln!(writer, "The token is incomplete"),
-            Self::ExpectedToken(Some(got), expected) => writeln!(writer, "Expected '{}', got '{}'", expected, got.ty),
-            Self::ExpectedToken(None, expected) => writeln!(writer, "Expected '{}' but input ended", expected),
-            Self::ExpectedValue(Some(got)) => writeln!(writer, "Expected a value, got '{}'", got.ty),
-            Self::ExpectedValue(None) => writeln!(writer, "Expected a value but input ended"),
-            Self::InvalidType(_, expected) => writeln!(writer, "This is not a valid '{}'", expected),
-            Self::NoDefault(_, ty) => writeln!(writer, "Expected a value of type '{}' which cannot be emptied", ty),
-            Self::NoField(_, structure, field_name) => writeln!(writer, "'{}' does not contain field {:?}", structure, field_name),
-            Self::MissingField(_, field, structure) => writeln!(writer, "'{}' requires field '{}' to be specified to create a new instance", structure, field),
-            Self::NoNew(_, ty) => writeln!(writer, "New instances of '{}' cannot be created", ty),
-            Self::Custom(_, msg) => writeln!(writer, "{}", msg)
+            Self::InvalidInput(_) => eprintln!("No token expects this input"),
+            Self::InvalidEscapeSequence(seq) => eprintln!("Escape sequence '{}' is invalid. Perhaps you meant '\\\\'?", seq.str),
+            Self::EndOfFile(_) => eprintln!("The token is incomplete"),
+            Self::ExpectedToken(Some(got), expected) => eprintln!("Expected '{}', got '{}'", expected, got.ty),
+            Self::ExpectedToken(None, expected) => eprintln!("Expected '{}' but input ended", expected),
+            Self::ExpectedValue(Some(got)) => eprintln!("Expected a value, got '{}'", got.ty),
+            Self::ExpectedValue(None) => eprintln!("Expected a value but input ended"),
+            Self::InvalidType(_, expected) => eprintln!("This is not a valid '{}'", expected),
+            Self::NoDefault(_, ty) => eprintln!("Expected a value of type '{}' which cannot be emptied", ty),
+            Self::NoField(_, structure, field_name) => eprintln!("'{}' does not contain field {:?}", structure, field_name),
+            Self::MissingField(_, field, structure) => eprintln!("'{}' requires field '{}' to be specified to create a new instance", structure, field),
+            Self::NoNew(_, ty) => eprintln!("New instances of '{}' cannot be created", ty),
+            Self::Custom(_, msg) => eprintln!("{}", msg)
         };
-        writeln!(writer);
+        eprintln!();
     }
     fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
         match self {

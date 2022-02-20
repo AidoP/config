@@ -136,7 +136,7 @@ fn derive_enum(ident: &syn::Ident, e: &syn::DataEnum) -> TokenStream {
     let variant_constructors = e.variants.iter().map(|variant| {
         let variant_data_type = format!("{}::{}", enum_ty, variant.ident);
         let variant_ident = &variant.ident;
-        let variant_name = variant.ident.to_string();
+        let variant_name = variant.ident.to_string().to_lowercase();
         match &variant.fields {
             Fields::Unit => quote!{ ::config::identifier!(#variant_name) => ::std::result::Result::Ok(Self::#variant_ident) },
             Fields::Unnamed(FieldsUnnamed {unnamed, ..}) if unnamed.len() == 0 => quote!{ ::config::identifier!(#variant_name) => ::std::result::Result::Ok(Self::#variant_ident()) },
@@ -188,7 +188,7 @@ fn derive_enum(ident: &syn::Ident, e: &syn::DataEnum) -> TokenStream {
     let variant_setters = e.variants.iter().map(|variant| {
         let variant_data_type = format!("{}::{}", enum_ty, variant.ident);
         let variant_ident = &variant.ident;
-        let variant_name = variant.ident.to_string();
+        let variant_name = variant.ident.to_string().to_lowercase();
         match &variant.fields {
             Fields::Unit => quote!{ ::config::identifier!(#variant_name) => *self = Self::#variant_ident },
             Fields::Unnamed(FieldsUnnamed {unnamed, ..}) if unnamed.len() == 0 => quote!{ ::config::identifier!(#variant_name) => *self = Self::#variant_ident() },
