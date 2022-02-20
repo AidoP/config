@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
     sync::{Mutex, RwLock, Arc, mpsc::Sender}
 };
-use super::{identifier, Result, Error, DataType, Value};
+use super::{identifier, span, Result, Error, DataType, Value};
 
 pub trait FromValue: Sized {
     fn data_type() -> DataType;
@@ -106,7 +106,7 @@ impl<T> FromValue for RwLock<T> where T: FromValue {
     }
 }
 impl<T> FromValue for Option<T> where T: FromValue {
-    fn data_type() -> DataType { DataType::Wrapper("optional", Box::new(T::data_type())) }
+    fn data_type() -> DataType { DataType::Multiple("Option", vec![T::data_type()]) }
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
         match value {
             identifier!("none") => Ok(None),
@@ -120,6 +120,30 @@ impl<T> FromValue for Option<T> where T: FromValue {
                 Some(t) => t.from_value_partial(value)?,
                 None => *self = Some(T::from_value_new(value)?)
             }
+        }
+        Ok(())
+    }
+}
+impl<T, E> FromValue for std::result::Result<T, E> where T: FromValue, E: FromValue {
+    fn data_type() -> DataType { DataType::Multiple("Result", vec![T::data_type(), E::data_type()]) }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            Value::NamedArray {name: span!("ok"), values, ..} if values.len() == 1 => T::from_value_new(values[0].deref()).map(|t| Ok(t)),
+            Value::NamedArray {name: span!("err"), values, ..} if values.len() == 1 => E::from_value_new(values[0].deref()).map(|t| Err(t)),
+            value => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+    fn from_value_partial<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
+        match value {
+            Value::NamedArray {name: span!("ok"), values, ..} if values.len() == 1 => match self {
+                Ok(t) => t.from_value_partial(values[0].deref())?,
+                Err(_) => *self = Ok(T::from_value_new(values[0].deref())?)
+            },
+            Value::NamedArray {name: span!("err"), values, ..} if values.len() == 1 => match self {
+                Err(e) => e.from_value_partial(values[0].deref())?,
+                Ok(_) => *self = Err(E::from_value_new(values[0].deref())?)
+            },
+            value => return Err(Error::InvalidType(value.clone(), Self::data_type()))
         }
         Ok(())
     }
@@ -151,7 +175,7 @@ impl<T, const N: usize> FromValue for [T; N] where T: FromValue {
     }
 }
 impl<T> FromValue for Vec<T> where T: FromValue {
-    fn data_type() -> DataType { DataType::Wrapper("list of", Box::new(T::data_type())) }
+    fn data_type() -> DataType { DataType::Multiple("Vec", vec![T::data_type()]) }
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
         match value {
             identifier!("none") => Ok(Vec::new()),
@@ -179,7 +203,7 @@ impl<T> FromValue for Vec<T> where T: FromValue {
     }
 }
 impl<K, V> FromValue for HashMap<K, V> where K: FromValue + Eq + std::hash::Hash, V: FromValue {
-    fn data_type() -> DataType { DataType::Dictionary(Box::new(K::data_type()), Box::new(V::data_type())) }
+    fn data_type() -> DataType { DataType::Multiple("HashMap", vec![K::data_type(), V::data_type()]) }
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
         match value {
             identifier!("none") => Ok(HashMap::new()),

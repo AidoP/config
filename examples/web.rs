@@ -15,7 +15,7 @@ enum Protocol {
 
 #[derive(Debug, Config)]
 struct Web {
-    address: std::net::IpAddr,
+    address: IpAddr,
     data_root: PathBuf,
     logins: Vec<Login>,
     protocols: HashMap<Protocol, u16>,

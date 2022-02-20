@@ -271,7 +271,7 @@ impl<'a> Lexer<'a> {
         let mut context = format!(" {1:<0$} | {3:>2$}", num_padding, ' ', from_arrow_padding, 'v');
         for (num, line) in coloured_lines.into_iter().enumerate() {
             let num = line_num + num;
-            context.push_str(&format!("\n {1:<0$} | {2}{3}", num_padding, num, line, RESET))
+            context.push_str(&format!("\n {blue}{1:<0$}{reset} | {2}{reset}", num_padding, num, line, blue=BLUE, reset=RESET))
         }
         context.push_str(&format!("\n {1:<0$} | {3:>2$}", num_padding, ' ', to_arrow_padding, '^'));
 
@@ -282,6 +282,12 @@ impl<'a> Lexer<'a> {
 macro_rules! identifier {
     ($identifier:expr) => {
         $crate::Value::Ident($crate::Spanned { str: $identifier, ..})
+    };
+}
+#[macro_export]
+macro_rules! span {
+    ($name:expr) => {
+        $crate::Spanned { str: $name, ..}
     };
 }
 #[derive(Debug, Clone, Copy)]
@@ -500,6 +506,18 @@ pub enum Value<'a> {
     /// A string with escaped values
     Escaped(Spanned<'a>),
     Ident(Spanned<'a>),
+    NamedArray {
+        name: Spanned<'a>,
+        open: Spanned<'a>,
+        values: Values<'a>,
+        close: Spanned<'a>
+    },
+    NamedStruct {
+        name: Spanned<'a>,
+        open: Spanned<'a>,
+        fields: Fields<'a>,
+        close: Spanned<'a>
+    },
     Array {
         open: Spanned<'a>,
         values: Values<'a>,
@@ -544,22 +562,34 @@ impl<'a> Values<'a> {
 impl<'a> Value<'a> {
     fn parse(tokens: &mut Tokens<'a, '_>) -> Result<'a, Self> {
         match tokens.pop().ok_or(Error::ExpectedValue(None))? {
-            Token { ty: TokenType::Ident, span } => Ok(Self::Ident(span)),
+            Token { ty: TokenType::Ident, span } => {
+                match tokens.peek() {
+                    Some(Token { ty: TokenType::ArrayOpen, ..}) => Ok(Self::NamedArray {
+                        name: span,
+                        open: tokens.pop_is(TokenType::ArrayOpen)?,
+                        values: Values::parse(tokens)?,
+                        close: tokens.pop_is(TokenType::ArrayClose)?
+                    }),
+                    Some(Token { ty: TokenType::StructOpen, ..}) => Ok(Self::NamedStruct {
+                        name: span,
+                        open: tokens.pop_is(TokenType::StructOpen)?,
+                        fields: Fields::parse(tokens)?,
+                        close: tokens.pop_is(TokenType::StructClose)?
+                    }),
+                    _ => Ok(Self::Ident(span))
+                }
+            },
             Token { ty: TokenType::Escaped, span } => Ok(Self::Escaped(span)),
-            Token { ty: TokenType::ArrayOpen, span: open } => {
-                Ok(Self::Array {
-                    open,
-                    values: Values::parse(tokens)?,
-                    close: tokens.pop_is(TokenType::ArrayClose)?
-                })
-            },
-            Token { ty: TokenType::StructOpen, span: open } => {
-                Ok(Self::Struct {
-                    open,
-                    fields: Fields::parse(tokens)?,
-                    close: tokens.pop_is(TokenType::StructClose)?
-                })
-            },
+            Token { ty: TokenType::ArrayOpen, span: open } => Ok(Self::Array {
+                open,
+                values: Values::parse(tokens)?,
+                close: tokens.pop_is(TokenType::ArrayClose)?
+            }),
+            Token { ty: TokenType::StructOpen, span: open } => Ok(Self::Struct {
+                open,
+                fields: Fields::parse(tokens)?,
+                close: tokens.pop_is(TokenType::StructClose)?
+            }),
             token => Err(Error::ExpectedValue(Some(token)))
         }
     }
@@ -599,8 +629,10 @@ impl<'a> Value<'a> {
         match self {
             Self::Ident(span) => *span,
             Self::Escaped(span) => *span,
-            Self::Array {open, close, ..} => lexer.between(*open, *close),
-            Self::Struct {open, close, ..} => lexer.between(*open, *close)
+            Self::NamedArray { name, close, ..} => lexer.between(*name, *close),
+            Self::NamedStruct { name, close, ..} => lexer.between(*name, *close),
+            Self::Array { open, close, ..} => lexer.between(*open, *close),
+            Self::Struct { open, close, ..} => lexer.between(*open, *close)
         }
     }
     /// Attempts to interpret the number in the form `[+|-][0(x|b|o)]\d*`, splitting into (sign, radix, digits) parts
@@ -640,18 +672,32 @@ impl<'a> Deref for Values<'a> {
 
 #[derive(Debug)]
 pub enum DataType {
-    Wrapper(&'static str, Box<DataType>),
+    //Wrapper(&'static str, Box<DataType>),
     Named(&'static str),
     Array(usize, Box<DataType>),
-    Dictionary(Box<DataType>, Box<DataType>)
+    //Dictionary(Box<DataType>, Box<DataType>),
+    Multiple(&'static str, Vec<DataType>)
 }
 impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Wrapper(prefix, wrapped) => write!(f, "{colour}{} {}{reset}", prefix, wrapped, colour=BLUE, reset=RESET),
+            //Self::Wrapper(prefix, wrapped) => write!(f, "{colour}{}{reset} {}", prefix, wrapped, colour=ORANGE, reset=RESET),
             Self::Named(name) => write!(f, "{colour}{}{reset}", name, colour=BLUE, reset=RESET),
             Self::Array(size, ty) => write!(f, "[{}; {colour}{}{reset}]", ty, size, colour=ORANGE, reset=RESET),
-            Self::Dictionary(keys, values) => write!(f, "dictionary with {} {colour}keys{reset} and {} {colour}values{reset}", keys, values, colour=ORANGE, reset=RESET)
+            //Self::Dictionary(keys, values) => write!(f, "{colour}dictionary{reset} with {} {colour}keys{reset} and {} {colour}values{reset}", keys, values, colour=ORANGE, reset=RESET),
+            Self::Multiple(name, inners) => {
+                write!(f, "{colour}{}{reset}<", name, colour=ORANGE, reset=RESET)?;
+                let mut first = true;
+                for inner in inners {
+                    if !first {
+                        write!(f, ", ")?;
+                    } else {
+                        first = false
+                    }
+                    write!(f, "{}", inner)?;
+                }
+                write!(f, ">")
+            }
         }
     }
 }
@@ -667,7 +713,7 @@ pub enum Error<'a> {
     ExpectedValue(Option<Token<'a>>),
     InvalidType(Value<'a>, DataType),
     NoDefault(Value<'a>, DataType),
-    NoField(Field<'a>, DataType),
+    NoField(Field<'a>, DataType, String),
     MissingField(Value<'a>, &'static str, DataType),
     NoNew(Value<'a>, DataType),
     Unavailable(Value<'a>)
@@ -678,7 +724,7 @@ impl<'a> Error<'a> {
     pub fn explain(self, writer: &mut dyn Write, location: &str, lexer: &Lexer) {
         let span = self.span(lexer);
         let (line, col) = lexer.position(span);
-        writeln!(writer, "error: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line));
+        writeln!(writer, "{red}error{reset}: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line), red=RED, reset=RESET);
         match self {
             Self::InvalidInput(_) => writeln!(writer, "No token expects this input"),
             Self::InvalidEscapeSequence(seq) => writeln!(writer, "Escape sequence '{}' is invalid. Perhaps you meant '\\\\'?", seq.str),
@@ -689,7 +735,7 @@ impl<'a> Error<'a> {
             Self::ExpectedValue(None) => writeln!(writer, "Expected a value but input ended"),
             Self::InvalidType(_, expected) => writeln!(writer, "This is not a valid '{}'", expected),
             Self::NoDefault(_, ty) => writeln!(writer, "Expected a value of type '{}' which cannot be emptied", ty),
-            Self::NoField(_, structure) => writeln!(writer, "'{}' does not contain this field", structure),
+            Self::NoField(_, structure, field_name) => writeln!(writer, "'{}' does not contain field {:?}", structure, field_name),
             Self::MissingField(_, field, structure) => writeln!(writer, "'{}' requires field '{}' to be specified to create a new instance", structure, field),
             Self::NoNew(_, ty) => writeln!(writer, "New instances of '{}' cannot be created", ty),
             Self::Unavailable(_) => writeln!(writer, "Field is inaccessible")
@@ -707,7 +753,7 @@ impl<'a> Error<'a> {
             Self::ExpectedValue(None) => lexer.end(),
             Self::InvalidType(value, _) => value.span(lexer),
             Self::NoDefault(none, _) => none.span(lexer),
-            Self::NoField(field, _) => field.span(lexer),
+            Self::NoField(field, _, _) => field.span(lexer),
             Self::MissingField(value, _, _) => value.span(lexer),
             Self::NoNew(value, _) => value.span(lexer),
             Self::Unavailable(value) => value.span(lexer)
