@@ -3,9 +3,14 @@
 
 An unobtrusive crate for loading config settings from various sources into Rust structs.
 
+Designed to be used with minimal effort while providing all of the features a user will expect.
+Any type can be supported by implementing `FromValue`, which most standard library types implement.
+A derive macro, `Config`, is provided to implement `FromValue` for structs and enums.
+
+No consideration for speed is made. If your program will be loading configurations or starting often, consider an alternative.
+
 ## Features
 - No dependencies, small crate footprint.
-- serde-like derive macro without the bells and whistles.
 - Infallible config loading. Start initialised with sane defaults.
 - Support most useful standard library types.
 - Automatically load config settings from various sources such as config files in conventional paths, environment variables and CLI args.
@@ -60,3 +65,10 @@ protocols: { http: 8000 }
 banned: none
 banned: [192.168.1.35, 192.168.1.63]
 ```
+
+## Alternatives
+- [clap](https://crates.io/crates/clap), a command line argument parser that can do it all
+- [Figment](https://crates.io/crates/figment), has a similar premise as this crate but using well-known formats
+
+## License
+This project is licensed under the [MIT License](http://opensource.org/licenses/MIT).
