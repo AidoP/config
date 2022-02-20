@@ -12,6 +12,9 @@ use std::{
 };
 use super::{identifier, span, Result, Error, DataType, Value};
 
+/// Parse a raw textual value into a Rust type
+/// 
+/// By default, only `from_value_new` is required to be implemented, howver, types must override `from_value_partial` to allow partial updates
 pub trait FromValue: Sized {
     fn data_type() -> DataType;
     fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self>;
@@ -243,6 +246,12 @@ impl FromValue for bool {
         }
     }
 }
+/// Implement `FromValue` for a type that implements `FromStr`
+/// 
+/// For types that do not implement Default, or whose default value is not applicable for in this context, use the macro in the form 
+/// `from_value!(!Default: "string", String)` to handle the special `none` value.
+/// 
+/// Does not allow for partial updates
 #[macro_export]
 macro_rules! from_value {
     ($name:expr, $ty:ty) => {

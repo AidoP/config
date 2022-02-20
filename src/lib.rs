@@ -9,8 +9,10 @@ use std::{
 
 mod from;
 pub use from::FromValue;
+/// Derive macro allowing structs and enums to be loaded from configuration sources.
+/// Primarily, implements `FromValue`
+pub use config_macro::Config;
 pub mod prelude {
-    pub use config_macro::Config;
     pub use super::Config;
 }
 
@@ -24,6 +26,9 @@ pub trait Struct {
 }
 
 impl<T> Config for T where T: Struct + Default {}
+/// Interface for loading from config sources. Implemented for all `Default` and `Config` deriving structs
+/// 
+/// See `Config::load()`
 pub trait Config: Struct + Default {
     /// Load the configuration from all default sources.
     /// 
@@ -152,18 +157,18 @@ pub trait Config: Struct + Default {
     }
 }
 
-pub struct Lexer<'a> {
+struct Lexer<'a> {
     source: &'a str,
     str: &'a str
 }
 impl<'a> Lexer<'a> {
-    pub fn new(source: &'a str) -> Self {
+    fn new(source: &'a str) -> Self {
         Self {
             source,
             str: source
         }
     }
-    pub fn lex(&mut self) -> Result<'a, Vec<Token<'a>>> {
+    fn lex(&mut self) -> Result<'a, Vec<Token<'a>>> {
         let mut tokens = Vec::new();
         while self.has_content() {
             tokens.push(Token::lex(self)?)
@@ -239,7 +244,7 @@ impl<'a> Lexer<'a> {
             starts
         }
     }
-    pub fn position(&self, span: Spanned<'a>) -> (usize, usize) {
+    fn position(&self, span: Spanned<'a>) -> (usize, usize) {
         let (mut col, mut row) = (0, 0);
         let chars = self.source.char_indices().take_while(|&(i, _)| i <= span.starts);
         for (_, char) in chars {
@@ -253,7 +258,7 @@ impl<'a> Lexer<'a> {
         }
         (row + 1, col)
     }
-    pub fn lines(&self, span: Spanned<'a>) -> Vec<Spanned<'a>> {
+    fn lines(&self, span: Spanned<'a>) -> Vec<Spanned<'a>> {
         let mut lines = Vec::new();
         let mut start = self.source[..span.starts].char_indices().rev().find_map(|(i, c)| (c == '\n').then(|| i + c.len_utf8())).unwrap_or(0);
         let mut end = self.source[span.starts..].char_indices().find_map(|(i, c)| (c == '\n').then(|| i + span.starts)).unwrap_or(self.source.len());
@@ -272,7 +277,7 @@ impl<'a> Lexer<'a> {
             end = self.source[start..].char_indices().find_map(|(i, c)| (c == '\n').then(|| i + start)).unwrap_or(self.source.len());
         }
     }
-    pub fn context(&self, span: Spanned<'a>, line_num: usize) -> String {
+    fn context(&self, span: Spanned<'a>, line_num: usize) -> String {
         let lines = self.lines(span);
         let mut coloured_lines = Vec::with_capacity(lines.len());
 
@@ -308,18 +313,21 @@ impl<'a> Lexer<'a> {
         context
     }
 }
+/// Helper for matching against `Value::Ident`
 #[macro_export]
 macro_rules! identifier {
     ($identifier:expr) => {
         $crate::Value::Ident($crate::Spanned { str: $identifier, ..})
     };
 }
+/// Helper for matching against spans nested inside a `Value`
 #[macro_export]
 macro_rules! span {
     ($name:expr) => {
         $crate::Spanned { str: $name, ..}
     };
 }
+/// A portion of the raw configuration source text
 #[derive(Debug, Clone, Copy)]
 pub struct Spanned<'a> {
     pub str: &'a str,
@@ -465,7 +473,7 @@ impl<'a> Token<'a> {
         }
     }
     /// Return the inner spanned or return Error::ExpectedToken if of the wrong token type
-    pub fn is(self, ty: TokenType) -> Result<'a, Spanned<'a>> {
+    fn is(self, ty: TokenType) -> Result<'a, Spanned<'a>> {
         if ty == self.ty {
             Ok(self.span)
         } else {
@@ -504,7 +512,7 @@ impl<'a> Field<'a> {
             _seperator: tokens.peek().map(|t| if t.ty == TokenType::Seperator { tokens.pop().map(|t| t.span) } else { None }).flatten()
         })
     }
-    pub fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
+    fn span(&self, lexer: &Lexer<'a>) -> Spanned<'a> {
         lexer.between(self.field.span(lexer), self.value.span(lexer))
     }
     pub fn field(&self) -> &Value<'a> {
@@ -531,6 +539,9 @@ impl<'a> Deref for Fields<'a> {
         &self.0
     }
 }
+/// An uninterpreted value
+/// 
+/// Through `FromValue`, a `Value` can be parsed into a plain Rust type
 #[derive(Debug, Clone)]
 pub enum Value<'a> {
     /// A string with escaped values
@@ -700,6 +711,7 @@ impl<'a> Deref for Values<'a> {
     }
 }
 
+/// A data type that loosely represesents a concrete Rust type, for display to an end user
 #[derive(Debug)]
 pub enum DataType {
     //Wrapper(&'static str, Box<DataType>),
@@ -734,6 +746,9 @@ impl fmt::Display for DataType {
 
 pub type Result<'a, T> = std::result::Result<T, Error<'a>>;
 #[derive(Debug)]
+/// An error occuring during the parsing of a configuration source
+/// 
+/// This will typically be created by `FromValue` implementations, but otherwise ignored
 pub enum Error<'a> {
     InvalidInput(Spanned<'a>),
     InvalidEscapeSequence(Spanned<'a>),
@@ -751,7 +766,7 @@ pub enum Error<'a> {
 impl<'a> Error<'a> {
     // It doesn't matter writing fails here
     #[allow(unused_must_use)]
-    pub fn explain(self, location: &str, lexer: &Lexer) {
+    fn explain(self, location: &str, lexer: &Lexer) {
         let span = self.span(lexer);
         let (line, col) = lexer.position(span);
         eprintln!("{red}error{reset}: Configuration invalid\nin {} @ Line {}, Column {}\n{}", location, line, col, lexer.context(span, line), red=RED, reset=RESET);
