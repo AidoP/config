@@ -1,12 +1,12 @@
 use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, TcpStream, UdpSocket},
     ops::{Deref, DerefMut},
     path::PathBuf,
     rc::Rc,
     str::FromStr,
-    sync::{Mutex, RwLock, Arc, mpsc::Sender}
+    sync::{Mutex, RwLock, Arc, mpsc::Sender}, fs::{File, ReadDir, self}, io::{Write, Read}
 };
 use super::{identifier, span, Result, Error, DataType, Value};
 
@@ -52,7 +52,7 @@ impl<T> FromValue for Rc<T> where T: FromValue {
         T::from_value_new(value).map(|t| Self::new(t))
     }
     fn from_value_partial<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        Self::get_mut(self).ok_or(Error::Unavailable(value.clone()))?.from_value_partial(value)
+        Self::get_mut(self).ok_or(Error::Custom(value.clone(), format!("This field is already in use")))?.from_value_partial(value)
     }
 }
 impl<T> FromValue for Arc<T> where T: FromValue {
@@ -61,7 +61,7 @@ impl<T> FromValue for Arc<T> where T: FromValue {
         T::from_value_new(value).map(|t| Self::new(t))
     }
     fn from_value_partial<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
-        Self::get_mut(self).ok_or(Error::Unavailable(value.clone()))?.from_value_partial(value)
+        Self::get_mut(self).ok_or(Error::Custom(value.clone(), format!("This field is already in use")))?.from_value_partial(value)
     }
 }
 impl<T> FromValue for Sender<T> where T: FromValue {
@@ -71,7 +71,7 @@ impl<T> FromValue for Sender<T> where T: FromValue {
     }
     fn from_value_partial<'a>(&mut self, value: &Value<'a>) -> Result<'a, ()> {
         if self.send(T::from_value_new(value)?).is_err() {
-            Err(Error::Unavailable(value.clone()))
+            Err(Error::Custom(value.clone(), format!("This field is no longer available")))
         } else {
             Ok(())
         }
@@ -340,7 +340,9 @@ from_value!{ "f64", f64 }
 from_value!{ "string",  String              }
 from_value!{ "string",  std::ffi::OsString  }
 from_value!{ "char",    char                }
-from_value!{ "path",    PathBuf             }
+
+// Though PathBuf implements default, it is likely undesireable for users to use `none` on the field
+from_value!{ !Default; "path",                   PathBuf      }
 
 from_value!{ !Default; "IP address",             IpAddr       }
 from_value!{ !Default; "IPv4 address",           Ipv4Addr     }
@@ -348,3 +350,137 @@ from_value!{ !Default; "IPv6 address",           Ipv6Addr     }
 from_value!{ !Default; "IP socket address",      SocketAddr   }
 from_value!{ !Default; "IPv4 socket address",    SocketAddrV4 }
 from_value!{ !Default; "IPv6 socket address",    SocketAddrV6 }
+
+impl FromValue for File {
+    fn data_type() -> DataType { PathBuf::data_type() }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let path = &PathBuf::from_value_new(value)?;
+                File::open(path).map_err(|e| Error::Custom(value.clone(), format!("Could not open {:?}: {}", path, e)))
+            }
+        }
+    }
+}
+impl FromValue for Box<dyn Read> {
+    fn data_type() -> DataType { DataType::Named("resource location") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            identifier!("none") => Ok(Box::new(std::io::empty()) as _),
+            identifier!("stdin") => Ok(Box::new(std::io::stdin()) as _),
+            Value::NamedArray {name: span!("file"), values, ..} if values.len() == 1 => {
+                let path = &PathBuf::from_value_new(&values[0])?;
+                File::open(path)
+                    .map(|file| Box::new(file) as _)
+                    .map_err(|e| Error::Custom(value.clone(), format!("Could not open {:?}: {}", path, e)))
+            },
+            Value::NamedArray {name: span!("tcp"), values, ..} if values.len() == 1 => {
+                TcpStream::from_value_new(&values[0]).map(|socket| Box::new(socket) as _)
+            },
+            #[cfg(target_family="unix")]
+            Value::NamedArray {name: span!("domain"), values, ..} | Value::NamedArray {name: span!("unix"), values, ..} if values.len() == 1 => {
+                std::os::unix::net::UnixStream::from_value_new(&values[0]).map(|socket| Box::new(socket) as _)
+            },
+            value => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for Box<dyn Write> {
+    fn data_type() -> DataType { DataType::Named("resource location") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            identifier!("none") => Ok(Box::new(std::io::sink()) as _),
+            identifier!("stdout") => Ok(Box::new(std::io::stdout()) as _),
+            identifier!("stderr") => Ok(Box::new(std::io::stderr()) as _),
+            Value::NamedArray {name: span!("file"), values, ..} if values.len() == 1 => {
+                let path = &PathBuf::from_value_new(&values[0])?;
+                File::create(path)
+                    .map(|file| Box::new(file) as _)
+                    .map_err(|e| Error::Custom(value.clone(), format!("Could not open {:?}: {}", path, e)))
+            },
+            Value::NamedArray {name: span!("tcp"), values, ..} if values.len() == 1 => {
+                TcpStream::from_value_new(&values[0]).map(|socket| Box::new(socket) as _)
+            },
+            #[cfg(target_family="unix")]
+            Value::NamedArray {name: span!("domain"), values, ..} | Value::NamedArray {name: span!("unix"), values, ..} if values.len() == 1 => {
+                std::os::unix::net::UnixStream::from_value_new(&values[0]).map(|socket| Box::new(socket) as _)
+            },
+            value => Err(Error::InvalidType(value.clone(), Self::data_type()))
+        }
+    }
+}
+impl FromValue for ReadDir {
+    fn data_type() -> DataType { PathBuf::data_type() }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let path = &PathBuf::from_value_new(value)?;
+                fs::read_dir(path).map_err(|e| Error::Custom(value.clone(), format!("Could not open {:?}: {}", path, e)))
+            }
+        }
+    }
+}
+impl FromValue for TcpListener {
+    fn data_type() -> DataType { DataType::Named("TCP listener") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let addr = SocketAddr::from_value_new(value)?;
+                TcpListener::bind(addr).map_err(|e| Error::Custom(value.clone(), format!("Could not bind to {:?}: {}", addr, e)))
+            }
+        }
+    }
+}
+impl FromValue for TcpStream {
+    fn data_type() -> DataType { DataType::Named("TCP stream") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let addr = SocketAddr::from_value_new(value)?;
+                TcpStream::connect(addr).map_err(|e| Error::Custom(value.clone(), format!("Could not connect to {:?}: {}", addr, e)))
+            }
+        }
+    }
+}
+impl FromValue for UdpSocket {
+    fn data_type() -> DataType { DataType::Named("UDP socket") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let addr = SocketAddr::from_value_new(value)?;
+                UdpSocket::bind(addr).map_err(|e| Error::Custom(value.clone(), format!("Could not bind to {:?}: {}", addr, e)))
+            }
+        }
+    }
+}
+#[cfg(target_family="unix")]
+impl FromValue for std::os::unix::net::UnixStream {
+    fn data_type() -> DataType { DataType::Named("unix domain socket") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let path = &PathBuf::from_value_new(value)?;
+                Self::connect(path).map_err(|e| Error::Custom(value.clone(), format!("Could not connect to {:?}: {}", path, e)))
+            }
+        }
+    }
+}
+#[cfg(target_family="unix")]
+impl FromValue for std::os::unix::net::UnixListener {
+    fn data_type() -> DataType { DataType::Named("unix domain socket listener") }
+    fn from_value_new<'a>(value: &Value<'a>) -> Result<'a, Self> {
+        match value {
+            value @ identifier!("none") => Err(Error::NoDefault(value.clone(), Self::data_type())),
+            value => {
+                let path = &PathBuf::from_value_new(value)?;
+                Self::bind(path).map_err(|e| Error::Custom(value.clone(), format!("Could not connect to {:?}: {}", path, e)))
+            }
+        }
+    }
+}

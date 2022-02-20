@@ -716,7 +716,7 @@ pub enum Error<'a> {
     NoField(Field<'a>, DataType, String),
     MissingField(Value<'a>, &'static str, DataType),
     NoNew(Value<'a>, DataType),
-    Unavailable(Value<'a>)
+    Custom(Value<'a>, String)
 }
 impl<'a> Error<'a> {
     // It doesn't matter writing fails here
@@ -738,7 +738,7 @@ impl<'a> Error<'a> {
             Self::NoField(_, structure, field_name) => writeln!(writer, "'{}' does not contain field {:?}", structure, field_name),
             Self::MissingField(_, field, structure) => writeln!(writer, "'{}' requires field '{}' to be specified to create a new instance", structure, field),
             Self::NoNew(_, ty) => writeln!(writer, "New instances of '{}' cannot be created", ty),
-            Self::Unavailable(_) => writeln!(writer, "Field is inaccessible")
+            Self::Custom(_, msg) => writeln!(writer, "{}", msg)
         };
         writeln!(writer);
     }
@@ -756,7 +756,7 @@ impl<'a> Error<'a> {
             Self::NoField(field, _, _) => field.span(lexer),
             Self::MissingField(value, _, _) => value.span(lexer),
             Self::NoNew(value, _) => value.span(lexer),
-            Self::Unavailable(value) => value.span(lexer)
+            Self::Custom(value, _) => value.span(lexer)
         }
     }
 }
