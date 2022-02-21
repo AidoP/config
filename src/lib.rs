@@ -4,7 +4,7 @@ use std::{
     fs::File,
     io::{self, Read},
     ops::Deref,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 mod from;
@@ -21,8 +21,71 @@ const BLUE: &'static str = "\x1b[94m";
 const ORANGE: &'static str = "\x1b[33m";
 const RESET: &'static str = "\x1b[0m";
 
+/// A structure that can be partially updated field-wise
 pub trait Struct {
+    /// Update self for the given raw field
     fn set<'a>(&mut self, field: &Field<'a>) -> Result<'a, ()>;
+}
+/// Get a list to all config file default search locations, in order.
+/// 
+/// The name should be a single lowercase ASCII word
+/// 
+/// - On \*nix, this will follow the XDG basedir spec
+/// - On Windows, this will use `%AppData%`
+/// - On MacOS this will use `Library`
+pub fn paths(name: &str) -> Vec<PathBuf> {
+    const INVALID_NAMES: &'static [&'static str] = &[
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "com0",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "lpt0"
+    ];
+    let name_lower = name.to_ascii_lowercase();
+    #[cfg(debug_assertions)]
+    assert!(!(name.is_empty() && name_lower == name && name.contains(|c: char| !c.is_ascii_alphanumeric()) && INVALID_NAMES.contains(&name)), "name must be ASCII alphanumeric characters only and not be a windows reserved file name to ensure compatability");
+
+    let path = &format!("{}.config", name);
+    let mut paths = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    {
+        // System config dirs
+        let configs = var_os("XDG_CONFIG_DIRS")
+            .and_then(|v| v.is_empty().not().then(|| v))
+            .unwrap_or_else(|| "/etc/xdg".into())
+            .into_vec();
+        let configs = configs.split(|&c| c == b':').map(|bytes| OsStr::from_bytes(bytes));
+        for config in configs {
+            if !config.is_empty() {
+                let mut new_path = PathBuf::from(config);
+                new_path.push(path);
+                paths.push(new_path)
+            }
+        }
+        // User config dir
+        use std::{env::var_os, ffi::OsStr, ops::Not, os::unix::ffi::{OsStrExt, OsStringExt}};
+        if let Some(mut config_base) = var_os("XDG_CONFIG_HOME")
+            .and_then(|v| v.is_empty().not().then(|| PathBuf::from(v)))
+            .or_else(|| var_os("HOME").map(|home| {
+                let mut path = PathBuf::from(home);
+                path.push(".config");
+                path
+            }))
+        {
+            config_base.push(path);
+            paths.push(config_base);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        todo!()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        todo!()
+    }
+    // The config file in the CWD has highest precedence on all platforms
+    paths.push(path.into());
+    paths
 }
 
 impl<T> Config for T where T: Struct + Default {}
@@ -49,7 +112,10 @@ pub trait Config: Struct + Default {
     /// 
     /// See `Config::load()`
     fn load_into(config: &mut Self, name: &str) {
-        config.load_file(format!("{}.config", name)).ok();
+        for path in paths(name) {
+            println!("loading from {:?}", &path);
+            let _ = config.load_file(path);
+        }
         config.load_env(name);
         config.load_args();
     }

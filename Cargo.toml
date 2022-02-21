@@ -8,3 +8,6 @@ license = "MIT"
 
 [dependencies]
 config-macro = { path = "config-macro" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.32"
