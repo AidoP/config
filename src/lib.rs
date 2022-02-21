@@ -1,3 +1,4 @@
+use core::slice;
 use std::{
     borrow::Cow,
     fmt,
@@ -77,11 +78,24 @@ pub fn paths(name: &str) -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        todo!()
+        use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+        use windows_sys::Win32::{Foundation::S_OK, System::Com::CoTaskMemFree, Globalization::lstrlenW, UI::Shell::*};
+        unsafe {
+            let mut string = std::ptr::null();
+            if SHGetKnownFolderPath(&FOLDERID_RoamingAppData, 0, 0, &mut string) == S_OK {
+                let len = lstrlenW(string);
+                let roaming_path = OsString::from_wide(slice::from_raw_parts(string, len as usize));
+                let mut roaming_path = PathBuf::from(roaming_path);
+                roaming_path.push(path);
+                paths.push(roaming_path)
+            }
+            CoTaskMemFree(string as _)
+        }
     }
     #[cfg(target_os = "macos")]
     {
-        todo!()
+        /// https://developer.apple.com/documentation/foundation/filemanager/searchpathdirectory/applicationsupportdirectory
+        const APPLICATION_SUPPORT_DIRECTORY: usize = 14;
     }
     // The config file in the CWD has highest precedence on all platforms
     paths.push(path.into());
