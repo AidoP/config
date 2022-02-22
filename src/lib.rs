@@ -122,8 +122,7 @@ pub fn paths(name: &str) -> Vec<PathBuf> {
             if let Some(mut new_thread) = ClassDecl::new("RSConfigThreadSpawner", ns_thread) {
                 new_thread.add_method(sel!(main), new_thread_main as extern "C" fn(&Object, Sel));
                 let thread = new_thread.register();
-                let thread: *mut Object = msg_send![thread, alloc];
-                let _: &Object = msg_send![thread, init];
+                let thread: &Object = msg_send![thread, new];
                 let _: *const Object = msg_send![super(thread, ns_thread), start];
                 while YES == msg_send![thread, isExecuting] {/* Wait for dummy thread to exit */}
                 let _: &Object = msg_send![thread, release];
