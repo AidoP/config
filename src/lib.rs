@@ -1,4 +1,3 @@
-use core::slice;
 use std::{
     borrow::Cow,
     fmt,
@@ -21,6 +20,16 @@ const RED: &'static str = "\x1b[91m";
 const BLUE: &'static str = "\x1b[94m";
 const ORANGE: &'static str = "\x1b[33m";
 const RESET: &'static str = "\x1b[0m";
+
+
+#[cfg(target_os = "macos")]
+#[macro_use]
+extern crate objc;
+#[cfg(target_os = "macos")]
+#[link(name = "Foundation", kind = "framework")]
+extern {
+    fn NSSearchPathForDirectoriesInDomains(directory: usize, domain: usize, expand: objc::runtime::BOOL) -> *const objc::runtime::Object;
+}
 
 /// A structure that can be partially updated field-wise
 pub trait Struct {
@@ -93,9 +102,58 @@ pub fn paths(name: &str) -> Vec<PathBuf> {
         }
     }
     #[cfg(target_os = "macos")]
-    {
+    /* very */ unsafe {
+        // Unfortunately, the only method to correctly get the paths on MacOS is through the Objective-C Foundation Library
+        use objc::{declare::{ClassDecl}, runtime::{BOOL, Sel, Object, YES, NO}};
         /// https://developer.apple.com/documentation/foundation/filemanager/searchpathdirectory/applicationsupportdirectory
         const APPLICATION_SUPPORT_DIRECTORY: usize = 14;
+        const USER_DOMAIN: usize = 1;
+        const LOCAL_DOMAIN: usize = 2;
+        let mut dirs = Vec::new();
+        
+        let ns_thread = class!(NSThread);
+        let main_thread: BOOL = msg_send![ns_thread, isMainThread];
+        let cocoa_multi_threaded: BOOL = msg_send![ns_thread, isMultiThreaded];
+        // If we are not on the main thread, the use of NSAutoreleasePool requires Cocoa to be in multi-threaded mode
+        if cocoa_multi_threaded == NO && main_thread == NO {
+            extern "C" fn new_thread_main(_this: &Object, _sel: Sel) {
+                let _: &Object = unsafe { msg_send![class!(NSThread), exit] };
+            }
+            if let Some(mut new_thread) = ClassDecl::new("RSConfigThreadSpawner", ns_thread) {
+                new_thread.add_method(sel!(main), new_thread_main as extern "C" fn(&Object, Sel));
+                let thread = new_thread.register();
+                let thread: *mut Object = msg_send![thread, alloc];
+                let _: &Object = msg_send![thread, init];
+                let _: *const Object = msg_send![super(thread, ns_thread), start];
+                while YES == msg_send![thread, isExecuting] {/* Wait for dummy thread to exit */}
+                let _: &Object = msg_send![thread, release];
+                let cocoa_multi_threaded: BOOL = msg_send![ns_thread, isMultiThreaded];
+                if cocoa_multi_threaded == NO {
+                    // Should only happen if there is an issue here and indicates we have entered invalid program state
+                    panic!("Cocoa failed to enter multi-threaded mode")
+                }
+            } else {
+                panic!("Cannot ensure Cocoa is in a valid state to be used off of the main thread")
+            }
+        }
+        let rc_pool: &Object = msg_send![class!(NSAutoreleasePool), new];
+        let mut for_domain = |domain| {
+            let paths = NSSearchPathForDirectoriesInDomains(APPLICATION_SUPPORT_DIRECTORY, domain, YES);
+            let iter: &Object = msg_send![paths, objectEnumerator];
+            while let Some(str) = || -> Option<&Object> { msg_send![iter, nextObject] }() {
+                let string: *const i8 = msg_send![str, UTF8String];
+                let string = std::ffi::CStr::from_ptr(string).to_str().unwrap(/* Guaranteed to be valid UTF-8 */);
+                dirs.push(std::ffi::OsString::from(string));
+            }
+        };
+        for_domain(USER_DOMAIN);
+        for_domain(LOCAL_DOMAIN);
+        let _: &Object = msg_send![rc_pool, drain];
+        for dir in dirs {
+            let mut app_support = PathBuf::from(dir);
+            app_support.push(path);
+            paths.push(app_support);
+        }
     }
     // The config file in the CWD has highest precedence on all platforms
     paths.push(path.into());
@@ -127,7 +185,6 @@ pub trait Config: Struct + Default {
     /// See `Config::load()`
     fn load_into(config: &mut Self, name: &str) {
         for path in paths(name) {
-            println!("loading from {:?}", &path);
             let _ = config.load_file(path);
         }
         config.load_env(name);
