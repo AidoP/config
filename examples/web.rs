@@ -3,8 +3,8 @@ use config::prelude::*;
 
 #[derive(Debug, Config)]
 struct Login {
-    username: String,
-    password: Option<String>
+    pub username: String,
+    pub password: Option<String>
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Config)]
@@ -15,11 +15,11 @@ enum Protocol {
 
 #[derive(Debug, Config)]
 struct Web {
-    address: IpAddr,
-    data_root: PathBuf,
-    logins: Vec<Login>,
-    protocols: HashMap<Protocol, u16>,
-    banned: Vec<IpAddr>
+    pub address: IpAddr,
+    pub data_root: PathBuf,
+    pub logins: Vec<Login>,
+    pub protocols: HashMap<Protocol, u16>,
+    pub banned: Vec<IpAddr>
 }
 impl Default for Web {
     fn default() -> Self {

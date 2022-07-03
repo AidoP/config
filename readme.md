@@ -10,7 +10,7 @@ A derive macro, `Config`, is provided to implement `FromValue` for structs and e
 No consideration for speed is made. If your program will be loading configurations or starting often, consider an alternative.
 
 ## Features
-- No dependencies, small crate footprint.
+- Minimal dependencies, small crate footprint.
 - Infallible config loading. Start initialised with sane defaults.
 - Support most useful standard library types.
 - Automatically load config settings from various sources such as config files in conventional paths, environment variables and CLI args.
@@ -26,8 +26,8 @@ use config::prelude::*;
 
 #[derive(Debug, Config)]
 struct Login {
-    username: String,
-    password: Option<String>
+    pub username: String,
+    pub password: Option<String>
 }
 #[derive(Debug, PartialEq, Eq, Hash, Config)]
 enum Protocol {
@@ -36,11 +36,11 @@ enum Protocol {
 }
 #[derive(Debug, Config)]
 struct Web {
-    address: IpAddr,
-    data_root: PathBuf,
-    logins: Vec<Login>,
-    protocols: HashMap<Protocol, u16>,
-    banned: Vec<IpAddr>
+    pub address: IpAddr,
+    pub data_root: PathBuf,
+    pub logins: Vec<Login>,
+    pub protocols: HashMap<Protocol, u16>,
+    pub banned: Vec<IpAddr>
 }
 impl Default for Web {/* Omitted */}
 
