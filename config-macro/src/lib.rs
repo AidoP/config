@@ -62,7 +62,7 @@ fn derive_struct(ident: &syn::Ident, s: &syn::DataStruct) -> TokenStream {
     let field_constructors: Vec<_> = s.fields.iter()
         .filter_map(|field|
             if let (Some(ident), syn::Visibility::Inherited) = (&field.ident, &field.vis) { 
-                Some(quote!{ #ident: ::std::default::Default::default() })
+                Some(quote_spanned!{field.ty.span()=> #ident: ::std::default::Default::default() })
             } else if let Some(ident) = &field.ident {
                 let field_name = ident.to_string();
                 let from_value_fn = quote_spanned! {field.ty.span()=> ::config::FromValue::from_value_new};
