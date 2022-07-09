@@ -168,8 +168,6 @@ pub trait Config: Struct + Default {
     /// 
     /// `name` is used to find files and as a prefix for environment variables and should be one word.
     /// 
-    /// `errors` specifies a writer for errors to be pretty-printed to, or stderr if None.
-    /// 
     /// ## Load Order
     /// - `<name>.config`
     /// - Environment Variables
@@ -177,6 +175,16 @@ pub trait Config: Struct + Default {
     fn load(name: &str) -> Self {
         let mut config = Self::default();
         Self::load_into(&mut config, name);
+        config
+    }
+    /// Load the configuration from default configuration files
+    /// 
+    /// `name` is used to find the files.
+    fn load_paths(name: &str) -> Self {
+        let mut config = Self::default();
+        for path in paths(name) {
+            let _ = config.load_file(path);
+        }
         config
     }
     /// Load the configuration from all default sources into an existing struct
